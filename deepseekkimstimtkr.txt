@@ -1,0 +1,442 @@
+
+import re
+import json
+import html
+import time
+import logging
+import aiohttp
+import os
+import sys
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+)
+
+# ═══════════════════════════════════════════════════════════
+#  CONFIG & CONSTANTS
+# ═══════════════════════════════════════════════════════════
+BOT_TOKEN = "8941917097:AAEc0gvnzZUp46PUUMWpMj_Ar52XlQHouK4"
+
+GBS_BASE = "https://admin.gbssystems.com/public/gateway/apiv1/api.php"
+GBS_KEY  = "JGAF5"
+
+LEAK_BASE = "https://leakinfo.pro/api"
+LEAK_KEY  = "DARK9e485b5b"
+
+MAIN_OWNER   = 8509827257
+SUPER_ADMINS = [8509827257]
+
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+TIMEOUT = 25
+MAX_LEN = 3900
+
+RATE_LIMIT_SECONDS = 5
+user_last_query = {}
+
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+log = logging.getLogger("osint")
+
+# ═══════════════════════════════════════════════════════════
+#  CUSTOM EMOJIS
+# ═══════════════════════════════════════════════════════════
+EMOJI_FIRE    = "5289722755871162900"
+EMOJI_STAR    = "5372849966689566579"
+EMOJI_ROCKET  = "5359664288241829619"
+EMOJI_CROWN   = "6237927637906364256"
+EMOJI_SHIELD  = "6235476345451716705"
+EMOJI_MONEY   = "6244678063775289843"
+EMOJI_PHONE   = "6239930832128056797"
+EMOJI_CHECK   = "4958689671950369798"
+EMOJI_CROSS   = "4958900559139570572"
+EMOJI_WARNING = "4958526153955476488"
+EMOJI_LOCK    = "4956719506027185156"
+EMOJI_GIFT    = "5084613633418199991"
+EMOJI_BELL    = "5098265504796115765"
+EMOJI_GEAR    = "5116414868357907335"
+EMOJI_VIDEO   = "5372849966689566579"
+
+DIV = "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯"
+
+def em(emoji_id: str, fallback: str = "⭐") -> str:
+    if emoji_id:
+        return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+    return fallback
+
+# ═══════════════════════════════════════════════════════════
+#  API LAYER
+# ═══════════════════════════════════════════════════════════
+async def _fetch_json(url: str, params: dict, timeout: int = TIMEOUT) -> dict:
+    try:
+        async with aiohttp.ClientSession(headers=UA) as s:
+            async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                text = await r.text()
+                if r.status != 200:
+                    return {"_error": f"HTTP {r.status}", "_raw": text[:400]}
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    return {"_raw": text[:2000]}
+    except Exception as e:
+        return {"_error": str(e)}
+
+async def gbs(cmd: str, query: str) -> dict:
+    return await _fetch_json(GBS_BASE, {"key": GBS_KEY, "cmd": cmd, "query": query})
+
+async def leak_vehicle(vehicle: str) -> dict:
+    return await _fetch_json(f"{LEAK_BASE}/vehicle_v6.php", {"key": LEAK_KEY, "vehicle": vehicle})
+
+# ═══════════════════════════════════════════════════════════
+#  FORMAT HELPERS
+# ═══════════════════════════════════════════════════════════
+def esc(x) -> str:
+    return html.escape(str(x), quote=False)
+
+def flatten(obj, prefix: str = "") -> list:
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                out += flatten(v, f"{key}.")
+            else:
+                out.append((key, v))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            if isinstance(v, (dict, list)):
+                out += flatten(v, f"{prefix}{i}.")
+            else:
+                out.append((f"{prefix}{i}", v))
+    return out
+
+def kv_block(data, max_fields: int = 50, max_val: int = 100) -> str:
+    rows = flatten(data)
+    lines = []
+    shown = 0
+    for k, v in rows:
+        if v is None or v == "" or v == [] or v == {}:
+            continue
+        s = str(v)
+        if len(s) > max_val:
+            s = s[:max_val] + "…"
+        lines.append(f"▪ <b>{esc(k)}</b>: <code>{esc(s)}</code>")
+        shown += 1
+        if shown >= max_fields:
+            lines.append(f"<i>… {len(rows)} fields total</i>")
+            break
+    return "\n".join(lines)
+
+async def safe_edit(msg, text: str):
+    if len(text) > MAX_LEN:
+        text = text[:MAX_LEN] + "\n<i>… truncated</i>"
+    try:
+        await msg.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    except Exception:
+        plain = re.sub(r"<[^>]+>", "", text)
+        try:
+            await msg.edit_text(plain, disable_web_page_preview=True)
+        except Exception:
+            pass
+
+# ═══════════════════════════════════════════════════════════
+#  MENU PAGES
+# ═══════════════════════════════════════════════════════════
+MENU_PAGES = [
+    {
+        "title": f"{em(EMOJI_PHONE, '📱')} <b>PAGE 1 / 6 — PHONE & NUMBER</b>",
+        "buttons": [
+            [("PHONE INFO", "q:phoneinfo", "📱"), ("NUMBER INFO", "q:number", "🔢")],
+            [("NUMBER V2", "q:numberv2", "🔢"), ("NUM TO UPI", "q:numtoupi", "💳")],
+            [("HP INFO", "q:hp", "📞"), ("SMART SEARCH", "q:all", "🌐")],
+        ]
+    },
+    {
+        "title": f"{em(EMOJI_ROCKET, '🚗')} <b>PAGE 2 / 6 — VEHICLE & RC</b>",
+        "buttons": [
+            [("VEHICLE INFO (COMBINED)", "q:vehicle", "🚗")],
+            [("VEHICLE RC", "q:rc", "🚙"), ("VEHICLE RC V2", "q:rc2", "🚙")],
+            [("VEHICLE NUMBER", "q:vehiclenum", "🔍"), ("V2N", "q:v2n", "🔁")],
+            [("SMC V1", "q:smcv1", "📄"), ("CHALLAN", "q:vehiclechallan", "🎫")],
+        ]
+    },
+    {
+        "title": f"{em(EMOJI_LOCK, '🪪')} <b>PAGE 3 / 6 — IDENTITY</b>",
+        "buttons": [
+            [("PAN INFO", "q:pan", "🪪"), ("PAN INFO V2", "q:pan2", "🪪")],
+        ]
+    },
+    {
+        "title": f"{em(EMOJI_GIFT, '🏠')} <b>PAGE 4 / 6 — WELFARE</b>",
+        "buttons": [
+            [("RATION CARD", "q:ration", "🏠"), ("FAMILY INFO", "q:family", "👨‍👩‍👧")],
+            [("LPG INFO", "q:lpg", "🔥")],
+        ]
+    },
+    {
+        "title": f"{em(EMOJI_BELL, '🌐')} <b>PAGE 5 / 6 — NETWORK</b>",
+        "buttons": [
+            [("IP INFO", "q:ip", "🌐")],
+        ]
+    },
+    {
+        "title": f"{em(EMOJI_STAR, 'ℹ️')} <b>PAGE 6 / 6 — HELP & SYSTEM</b>",
+        "buttons": [
+            [("BOT INFO", "q:help", "ℹ️"), ("DOWNLOAD SOURCE", "q:download", "📥")],
+        ]
+    }
+]
+
+# ═══════════════════════════════════════════════════════════
+#  BOT HANDLERS
+# ═══════════════════════════════════════════════════════════
+async def render_menu(message, page: int, edit: bool = True):
+    pg = MENU_PAGES[page]
+    kb = []
+    for row in pg["buttons"]:
+        kb_row = []
+        for label, cb, emoji in row:
+            kb_row.append(InlineKeyboardButton(f"{emoji} {label}", callback_data=cb))
+        kb.append(kb_row)
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("« PREV", callback_data="page:prev"))
+    else:
+        nav.append(InlineKeyboardButton("🏠 HOME", callback_data="page:home"))
+    
+    if page < len(MENU_PAGES) - 1:
+        nav.append(InlineKeyboardButton("NEXT »", callback_data="page:next"))
+    else:
+        nav.append(InlineKeyboardButton("🔄 RELOAD", callback_data="page:home"))
+    kb.append(nav)
+
+    text = (
+        f"{pg['title']}\n"
+        f"{DIV}\n\n"
+        f"{em(EMOJI_CROWN, '👑')} <i>Bot made by: @DARK_OSINT5</i>"
+    )
+
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+    else:
+        await message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["awaiting"] = None
+    context.user_data["page"] = 0
+    await render_menu(update.message, 0, edit=False)
+
+async def download_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file_path = os.path.abspath(sys.argv[0])
+    if not os.path.exists(file_path):
+        await update.message.reply_text("❌ Source file not found!")
+        return
+    
+    msg = await update.message.reply_text("📥 Uploading source code...")
+    await update.message.reply_document(
+        document=InputFile(file_path, filename="osint_bot.py"),
+        caption=f"{em(EMOJI_ROCKET, '🚀')} <b>OSINT Console Bot Source</b>",
+        parse_mode=ParseMode.HTML
+    )
+    await msg.delete()
+
+async def page_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    context.user_data["awaiting"] = None
+    data = query.data
+    
+    if data == "page:home":
+        page = 0
+    elif data == "page:next":
+        page = (context.user_data.get("page", 0) + 1) % len(MENU_PAGES)
+    elif data == "page:prev":
+        page = (context.user_data.get("page", 0) - 1) % len(MENU_PAGES)
+    else:
+        page = 0
+        
+    context.user_data["page"] = page
+    await render_menu(query.message, page)
+
+async def query_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    data = query.data
+    
+    now = time.time()
+    if uid not in SUPER_ADMINS:
+        last = user_last_query.get(uid, 0)
+        if now - last < RATE_LIMIT_SECONDS:
+            wait = int(RATE_LIMIT_SECONDS - (now - last))
+            await query.answer(f"⏳ Rate limited! Wait {wait}s.", show_alert=True)
+            return
+        user_last_query[uid] = now
+
+    if data == "q:help":
+        text = (
+            f"{em(EMOJI_STAR, 'ℹ️')} <b>OSINT CONSOLE BOT</b>\n"
+            f"{DIV}\n\n"
+            f"▪ <b>Developer:</b> @DARK_OSINT5\n"
+            f"▪ <b>APIs:</b> gbssystems + leakinfo.pro\n"
+            f"▪ <b>Features:</b> Vehicle, Phone, PAN, Ration, Family, LPG, IP\n\n"
+            f"<i>Select a category from the menu and send the required input.</i>"
+        )
+        await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« BACK", callback_data="page:home")]]), parse_mode=ParseMode.HTML)
+        return
+        
+    if data == "q:download":
+        await query.message.reply_text("📥 Sending source code below...")
+        await download_cmd(update, context)
+        return
+
+    cmd = data.split(":", 1)[1]
+    context.user_data["awaiting"] = cmd
+    
+    label = cmd
+    for pg in MENU_PAGES:
+        for row in pg["buttons"]:
+            for l, c, e in row:
+                if c == data:
+                    label = l
+                    break
+                
+    await query.message.edit_text(
+        f"{em(EMOJI_GEAR, '⚙️')} <b>SEARCH: {label.upper()}</b>\n"
+        f"{DIV}\n\n"
+        f"Send me the <b>{label}</b> to search:\n"
+        f"<i>(Or click Back to menu)</i>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("« BACK TO MENU", callback_data="page:home")]
+        ]),
+        parse_mode=ParseMode.HTML
+    )
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    awaiting = context.user_data.get("awaiting")
+    if not awaiting:
+        return
+        
+    query = update.message.text.strip()
+    context.user_data["awaiting"] = None
+    
+    msg = await update.message.reply_text(
+        f"{em(EMOJI_GEAR, '⚙️')} Searching <code>{esc(query)}</code> ...", 
+        parse_mode=ParseMode.HTML
+    )
+    
+    if awaiting == "vehicle":
+        await run_combined_vehicle(msg, query)
+    elif awaiting == "all":
+        await run_all(msg, query)
+    else:
+        await run_gbs(msg, awaiting, query)
+
+# ═══════════════════════════════════════════════════════════
+#  SEARCH LOGIC
+# ═══════════════════════════════════════════════════════════
+async def run_gbs(msg, cmd, query):
+    data = await gbs(cmd, query)
+    out = f"🔍 <b>{cmd.upper()}</b> — <code>{esc(query)}</code>\n{DIV}\n\n"
+    if "_error" in data:
+        out += f"{em(EMOJI_CROSS, '❌')} <b>Error:</b> <code>{esc(data['_error'])}</code>"
+    elif "_raw" in data:
+        out += f"{em(EMOJI_WARNING, '⚠️')} <b>Raw output:</b>\n<code>{esc(data['_raw'][:1000])}</code>"
+    else:
+        out += kv_block(data, max_fields=40) or "❌ empty response"
+    await safe_edit(msg, out)
+
+async def run_combined_vehicle(msg, vehicle):
+    vehicle = vehicle.upper()
+    leak = await leak_vehicle(vehicle)
+    rc = await gbs("rc", vehicle)
+    rc2 = await gbs("rc2", vehicle)
+    
+    out = f"🚗 <b>VEHICLE INFO</b> — <code>{esc(vehicle)}</code>\n{DIV}\n\n"
+    
+    out += f"{em(EMOJI_FIRE, '🔥')} <b>LEAKINFO V6</b>\n"
+    if "_error" in leak:
+        out += f"❌ error: {esc(leak['_error'])}\n"
+    elif not leak.get("success"):
+        out += f"❌ no data\n"
+    else:
+        data = leak.get("data", {})
+        out += kv_block(data, max_fields=15)
+        rl = (leak.get("rate_limits") or [{}])[0]
+        if rl.get("remaining") is not None:
+            out += f"\n<i>rate: {rl.get('remaining')}/{rl.get('limit')}</i>"
+    out += f"\n{DIV}\n"
+    
+    out += f"{em(EMOJI_SHIELD, '🛡')} <b>GBS RC</b>\n"
+    if "_error" in rc:
+        out += f"❌ error: {esc(rc['_error'])}\n"
+    else:
+        out += kv_block(rc, max_fields=15) or "❌ empty\n"
+    out += f"\n{DIV}\n"
+    
+    out += f"{em(EMOJI_SHIELD, '🛡')} <b>GBS RC v2</b>\n"
+    if "_error" in rc2:
+        out += f"❌ error: {esc(rc2['_error'])}\n"
+    else:
+        out += kv_block(rc2, max_fields=15) or "❌ empty\n"
+        
+    await safe_edit(msg, out)
+
+async def run_all(msg, query):
+    qs = query.strip()
+    digits = qs.replace("+","").replace("-","").replace(" ","")
+    out = f"{em(EMOJI_BELL, '🌐')} <b>SMART SEARCH</b> — <code>{esc(query)}</code>\n{DIV}\n\n"
+    
+    plan = []
+    if digits.isdigit():
+        plan = [("phoneinfo", "Phone Info"), ("number", "Number Lookup"), ("numtoupi", "UPI")]
+        if len(digits) == 12:
+            plan += [("ration", "Ration"), ("family", "Family")]
+    elif len(qs) == 10 and qs[:5].isalpha() and qs[5:].isdigit():
+        plan = [("pan", "PAN"), ("pan2", "PAN v2")]
+    elif qs.count(".") == 3 and all(p.isdigit() for p in qs.split(".")):
+        plan = [("ip", "IP Info")]
+    else:
+        v = qs.upper()
+        plan = [("rc", "Vehicle RC"), ("rc2", "RC v2"), ("vehiclenum", "Veh Number"), ("v2n", "V2N"), ("smcv1", "SMC"), ("vehiclechallan", "Challan")]
+        leak = await leak_vehicle(v)
+        out += f"{em(EMOJI_FIRE, '🔥')} <b>LEAKINFO V6</b>\n"
+        if not leak.get("_error") and leak.get("success"):
+            out += kv_block(leak.get("data", {}), max_fields=10) + "\n\n"
+        else:
+            out += "❌ no data\n\n"
+
+    for cmd, label in plan:
+        out += f"{em(EMOJI_SHIELD, '🛡')} <b>{label}</b>\n"
+        data = await gbs(cmd, qs.upper() if cmd in ["rc", "rc2", "vehiclenum", "v2n", "smcv1", "vehiclechallan"] else qs)
+        if "_error" in data:
+            out += f"❌ {esc(data['_error'])}\n\n"
+        else:
+            block = kv_block(data, max_fields=8, max_val=50)
+            out += (block or "❌ empty") + "\n\n"
+            
+    await safe_edit(msg, out)
+
+# ═══════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("download", download_cmd))
+    app.add_handler(CallbackQueryHandler(page_cb, pattern="^page:"))
+    app.add_handler(CallbackQueryHandler(query_cb, pattern="^q:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    
+    log.info("OSINT Bot is running...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
+```
